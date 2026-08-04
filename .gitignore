@@ -5,9 +5,16 @@
 node_modules/
 dist/
 build/
+.next/
+.expo/
+.turbo/
+.vercel/
 .venv/
 __pycache__/
 *.pyc
 .idea/
 .vscode/
 *.log
+*.tsbuildinfo
+coverage/
+.pnpm-store/
