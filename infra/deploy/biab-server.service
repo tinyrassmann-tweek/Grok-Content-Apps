@@ -1,0 +1,16 @@
+[Unit]
+Description=B.i.a.B collab server (Fastify + y-websocket)
+After=network.target postgresql.service redis.service docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=__REMOTE_PATH__
+EnvironmentFile=__REMOTE_PATH__/.env
+ExecStart=/usr/bin/env pnpm --filter @biab/server start
+Restart=on-failure
+RestartSec=5
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target

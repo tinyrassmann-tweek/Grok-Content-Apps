@@ -1,7 +1,7 @@
 -- B.i.a.B collab — initial schema
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   stream TEXT,                     -- genesis | think_tank | digital_store | ancestry | trading | god_fund
@@ -9,7 +9,7 @@ CREATE TABLE tenants (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID REFERENCES tenants(id),
   email TEXT UNIQUE NOT NULL,
@@ -18,8 +18,9 @@ CREATE TABLE users (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE artifacts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- Artifact ids are TEXT so human-friendly slugs (demo, demo-artifact) work in URLs.
+CREATE TABLE IF NOT EXISTS artifacts (
+  id TEXT PRIMARY KEY,
   tenant_id UUID REFERENCES tenants(id),
   kind TEXT NOT NULL,              -- project | task | doc | care_plan | listing | trading_strategy | campaign | app_spec
   title TEXT,
@@ -29,19 +30,19 @@ CREATE TABLE artifacts (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE op_log (
+CREATE TABLE IF NOT EXISTS op_log (
   id BIGSERIAL PRIMARY KEY,
-  artifact_id UUID REFERENCES artifacts(id),
-  actor_id UUID,
+  artifact_id TEXT REFERENCES artifacts(id),
+  actor_id TEXT,
   actor_kind TEXT,                 -- human | ai
   update BYTEA NOT NULL,
   ts TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
   id BIGSERIAL PRIMARY KEY,
   tenant_id UUID,
-  actor_id UUID,
+  actor_id TEXT,
   event TEXT,
   payload JSONB,
   prev_hash TEXT,
@@ -49,5 +50,5 @@ CREATE TABLE audit_log (
   ts TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX artifacts_tenant_kind_idx ON artifacts (tenant_id, kind);
-CREATE INDEX op_log_artifact_ts_idx ON op_log (artifact_id, ts);
+CREATE INDEX IF NOT EXISTS artifacts_tenant_kind_idx ON artifacts (tenant_id, kind);
+CREATE INDEX IF NOT EXISTS op_log_artifact_ts_idx ON op_log (artifact_id, ts);

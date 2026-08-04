@@ -1,50 +1,89 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
-import { Pool } from "pg";
-import { Redis } from "ioredis";
-import jwt from "jsonwebtoken";
+import cors from "@fastify/cors";
 import type { WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
-import { setupWSConnection } from "./y-ws.js";
-
-const DATABASE_URL =
-  process.env.DATABASE_URL ?? "postgres://biab:biab@localhost:5432/biab";
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
-const JWT_SECRET = process.env.JWT_SECRET ?? "dev-only-replace-me-32-bytes!!";
-const PORT = Number(process.env.PORT ?? 4000);
-
-const pg = new Pool({ connectionString: DATABASE_URL });
-const redis = new Redis(REDIS_URL, {
-  lazyConnect: true,
-  maxRetriesPerRequest: 1,
-  enableOfflineQueue: false,
-});
+import { config } from "./config.js";
+import { verifyToken, mintDevToken } from "./auth.js";
+import { ensureArtifact, getArtifactMeta, pg } from "./db.js";
+import { initPresence, presenceAdd, presenceRemove, presenceList } from "./presence.js";
+import { setupWSConnection, wireYWebsocket } from "./y-ws.js";
+import { registerBlakeRoutes } from "./blake-routes.js";
 
 const app = Fastify({ logger: true });
-redis.on("error", (err) => {
-  app.log.warn({ err: err.message }, "redis");
-});
-void redis.connect().catch(() => {
-  app.log.warn(
-    "redis unavailable — presence tracking disabled until Redis is up"
-  );
+
+initPresence(app.log);
+wireYWebsocket();
+
+await app.register(cors, {
+  origin: true,
+  credentials: true,
 });
 await app.register(websocket);
 
-app.get("/healthz", async () => ({ ok: true, brand: "TTSAI" }));
+app.get("/healthz", async () => ({
+  ok: true,
+  brand: "TTSAI",
+  devAuth: config.allowDevAuth,
+}));
+
+/** Dev JWT mint — no Clerk required */
+app.post<{
+  Body: { name?: string; email?: string; artifactId?: string };
+}>("/auth/dev-token", async (req, reply) => {
+  if (!config.allowDevAuth) {
+    return reply.code(403).send({ error: "dev auth disabled in production" });
+  }
+  try {
+    const result = await mintDevToken(req.body ?? {});
+    return {
+      ok: true,
+      token: result.token,
+      user: result.user,
+      expiresIn: result.expiresIn,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "mint failed";
+    return reply.code(500).send({ error: message });
+  }
+});
+
+app.get("/auth/dev-token", async (req, reply) => {
+  if (!config.allowDevAuth) {
+    return reply.code(403).send({ error: "dev auth disabled in production" });
+  }
+  const q = req.query as { artifactId?: string };
+  try {
+    const result = await mintDevToken({ artifactId: q.artifactId });
+    return {
+      ok: true,
+      token: result.token,
+      user: result.user,
+      expiresIn: result.expiresIn,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "mint failed";
+    return reply.code(500).send({ error: message });
+  }
+});
+
+app.get<{ Params: { artifactId: string } }>(
+  "/presence/:artifactId",
+  async (req) => {
+    const users = await presenceList(req.params.artifactId);
+    return { artifactId: req.params.artifactId, users };
+  }
+);
 
 app.get(
   "/collab/:artifactId",
   { websocket: true },
   (socket: WebSocket, req) => {
     const token = (req.query as { token?: string }).token ?? "";
-    let user: { sub: string; tenantId: string };
+    let user: ReturnType<typeof verifyToken>;
 
     try {
-      user = jwt.verify(token, JWT_SECRET) as {
-        sub: string;
-        tenantId: string;
-      };
+      user = verifyToken(token);
     } catch {
       socket.close(4401, "unauthorized");
       return;
@@ -53,35 +92,50 @@ app.get(
     const artifactId = (req.params as { artifactId: string }).artifactId;
     const rawReq = req.raw as IncomingMessage;
 
-    pg.query(
-      "SELECT acl, hipaa_local_only FROM artifacts WHERE id=$1 AND tenant_id=$2",
-      [artifactId, user.tenantId]
-    )
-      .then((r) => {
-        if (r.rowCount === 0) {
+    void (async () => {
+      try {
+        // Auto-provision artifact for the tenant (dev-friendly)
+        await ensureArtifact(artifactId, user.tenantId);
+        const meta = await getArtifactMeta(artifactId, user.tenantId);
+        if (!meta) {
           socket.close(4403, "forbidden");
           return;
         }
-        if (r.rows[0].hipaa_local_only && !req.headers["x-lan-token"]) {
+        if (meta.hipaa_local_only && !req.headers["x-lan-token"]) {
           socket.close(4403, "hipaa_lan_only");
           return;
         }
 
         setupWSConnection(socket, rawReq, { docName: artifactId });
-        void redis.sadd(`presence:${artifactId}`, user.sub);
+        await presenceAdd(artifactId, user.sub);
         socket.on("close", () => {
-          void redis.srem(`presence:${artifactId}`, user.sub);
+          void presenceRemove(artifactId, user.sub);
         });
-      })
-      .catch((err) => {
+      } catch (err) {
         app.log.error(err);
         socket.close(4500, "server_error");
-      });
+      }
+    })();
   }
 );
 
+await registerBlakeRoutes(app);
+
+// Fail fast if DB unreachable
 try {
-  await app.listen({ port: PORT, host: "0.0.0.0" });
+  await pg.query("SELECT 1");
+  app.log.info("postgres connected");
+} catch (err) {
+  app.log.error(err);
+  app.log.error("DATABASE_URL unreachable — start Postgres / run migrations");
+  process.exit(1);
+}
+
+try {
+  await app.listen({ port: config.port, host: "0.0.0.0" });
+  app.log.info(
+    `B.i.a.B collab server on :${config.port} (devAuth=${config.allowDevAuth})`
+  );
 } catch (err) {
   app.log.error(err);
   process.exit(1);
